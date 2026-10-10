@@ -1,5 +1,5 @@
 use arboard::{Clipboard, ImageData};
-use input_event::{clipboard_key_image, ClipboardEvent};
+use input_event::{ClipboardEvent, clipboard_key_image};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::task::spawn_blocking;
@@ -138,8 +138,7 @@ impl ClipboardEmulation {
 /// Get the shared clipboard handle, opening one on first use.
 fn get_or_create(clipboard: &mut Option<Clipboard>) -> Result<&mut Clipboard, ClipboardError> {
     if clipboard.is_none() {
-        *clipboard =
-            Some(Clipboard::new().map_err(|e| ClipboardError::Access(format!("{e}")))?);
+        *clipboard = Some(Clipboard::new().map_err(|e| ClipboardError::Access(format!("{e}")))?);
     }
     Ok(clipboard.as_mut().expect("clipboard just opened"))
 }

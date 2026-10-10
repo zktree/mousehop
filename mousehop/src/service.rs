@@ -15,9 +15,9 @@ use futures::StreamExt;
 use input_capture::clipboard::{ClipboardMonitor, SuppressionList};
 use input_capture::frontmost_app;
 use input_emulation::clipboard::ClipboardEmulation;
-use input_event::{clipboard_key_text, ClipboardEvent, Event as InputEvent};
-use local_channel::mpsc::{Receiver, channel};
+use input_event::{ClipboardEvent, Event as InputEvent, clipboard_key_text};
 use local_channel::mpsc::Sender;
+use local_channel::mpsc::{Receiver, channel};
 use log;
 use mousehop_ipc::{
     AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FrontendEvent, FrontendRequest,
@@ -36,8 +36,8 @@ use std::{
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::{process::Command, signal, sync::Notify};
 use tokio::task::spawn_local;
+use tokio::{process::Command, signal, sync::Notify};
 
 async fn shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]
@@ -1127,12 +1127,12 @@ impl Service {
         if self.incoming_conns.iter().any(|addr| addr.ip() == ip) {
             return true;
         }
-        self.client_manager.get_client_states().iter().any(
-            |(_, _, state)| {
-                state.ips.contains(&ip)
-                    || state.active_addr.is_some_and(|addr| addr.ip() == ip)
-            },
-        )
+        self.client_manager
+            .get_client_states()
+            .iter()
+            .any(|(_, _, state)| {
+                state.ips.contains(&ip) || state.active_addr.is_some_and(|addr| addr.ip() == ip)
+            })
     }
 
     /// Forwarded clipboard frame just landed via the listen side

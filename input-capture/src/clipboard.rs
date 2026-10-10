@@ -1,5 +1,5 @@
 use arboard::Clipboard;
-use input_event::{clipboard_key_image, clipboard_key_text, ClipboardEvent, Event};
+use input_event::{ClipboardEvent, Event, clipboard_key_image, clipboard_key_text};
 use mousehop_ipc::AppIdent;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -234,7 +234,9 @@ impl ClipboardMonitor {
                             let event = match polled {
                                 Polled::Text(text) => {
                                     log::info!("Clipboard text changed, {} bytes", text.len());
-                                    CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text(text)))
+                                    CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text(
+                                        text,
+                                    )))
                                 }
                                 Polled::Image {
                                     width,
@@ -309,10 +311,7 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
         .ok_or("pixel buffer does not match dimensions")?;
     let mut png = Vec::new();
     image
-        .write_to(
-            &mut std::io::Cursor::new(&mut png),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
     Ok(png)
 }

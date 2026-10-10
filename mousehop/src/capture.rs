@@ -1777,6 +1777,15 @@ impl CaptureTask {
             CaptureEvent::HostInputState(_) => {
                 unreachable!("handled in early return above")
             }
+            // Clipboard images never reach this stream: the clipboard
+            // monitor has its own channel into Service, and images ride
+            // the side TCP channel (`service::broadcast_clipboard_image`).
+            // Ignore instead of panicking so a stray event can't take
+            // down mouse/keyboard sharing.
+            CaptureEvent::ClipboardImage(_) => {
+                log::warn!("ignoring clipboard image on the input capture stream");
+                return Ok(());
+            }
         };
 
         let sent_input = match &proto_event {
