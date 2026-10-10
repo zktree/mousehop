@@ -174,7 +174,9 @@ jobs:
     - name: Make icns
       run: scripts/makeicns.sh
     - name: Install cargo bundle
-      run: cargo install cargo-bundle
+      # 0.12 把 osx_info_plist_exts 挪到了 [package.metadata.bundle.osx]，
+      # 与本项目的 Cargo.toml 不兼容；先钉在 0.11。
+      run: cargo install cargo-bundle --version 0.11.0
     - name: Bundle
       # Must run from mousehop/ so cargo-bundle's icon / resources /
       # osx_info_plist_exts globs resolve against the manifest dir.
@@ -243,7 +245,8 @@ jobs:
     - name: Make icns
       run: scripts/makeicns.sh
     - name: Install cargo bundle
-      run: cargo install cargo-bundle
+      # 同 macos-release-build：cargo-bundle 0.12 改了 osx_info_plist_exts 的位置。
+      run: cargo install cargo-bundle --version 0.11.0
     - name: Bundle
       # Must run from mousehop/ so cargo-bundle's icon / resources /
       # osx_info_plist_exts globs resolve against the manifest dir.
