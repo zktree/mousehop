@@ -25,6 +25,10 @@ tokio = { version = "1.32.0", features = [
 ] }
 once_cell = "1.19.0"
 arboard = { version = "3.4", features = ["wayland-data-control"] }
+# PNG decode for images arriving from a peer's clipboard. Already
+# pulled in transitively via arboard's image-data support, so listing
+# it here just pins the direct use.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
 bitflags = "2.6.0"

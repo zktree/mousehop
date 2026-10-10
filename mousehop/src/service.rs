@@ -14,8 +14,10 @@ use crate::{
 use futures::StreamExt;
 use input_capture::clipboard::{ClipboardMonitor, SuppressionList};
 use input_capture::frontmost_app;
-use input_event::{ClipboardEvent, Event as InputEvent};
+use input_emulation::clipboard::ClipboardEmulation;
+use input_event::{clipboard_key_text, ClipboardEvent, Event as InputEvent};
 use local_channel::mpsc::{Receiver, channel};
+use local_channel::mpsc::Sender;
 use log;
 use mousehop_ipc::{
     AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FrontendEvent, FrontendRequest,
@@ -27,12 +29,15 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::{process::Command, signal, sync::Notify};
+use tokio::task::spawn_local;
 
 async fn shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]
@@ -59,6 +64,96 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+}
+
+/// Size cap for a clipboard image on the side channel. Screenshots are
+/// the target use case; this is far beyond any lossless screenshot and
+/// bounds what a peer can make us allocate.
+const MAX_CLIPBOARD_IMAGE: usize = 16 * 1024 * 1024;
+
+/// A clipboard image that arrived on the side channel.
+struct IncomingImage {
+    from: SocketAddr,
+    png: Vec<u8>,
+}
+
+/// One-shot TCP receiver for clipboard images.
+///
+/// Images are orders of magnitude larger than the input protocol's 4 KiB
+/// datagram budget (`mousehop_proto::MAX_CLIPBOARD_SIZE`), so they skip
+/// the DTLS channel entirely: the sending peer dials this port, writes a
+/// big-endian `u32` length followed by PNG bytes, and closes. TCP
+/// supplies the chunking, ordering and retransmission the input
+/// protocol deliberately has no need for.
+///
+/// `shortcut: IPv4 only, and the port is fixed at startup — a peer that
+/// reconfigures its listen port at runtime keeps the old image port
+/// until restart.`
+async fn clipboard_image_listener(port: u16, tx: Sender<IncomingImage>) {
+    let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let listener = match TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            log::warn!("clipboard image channel disabled: binding tcp {bind} failed: {e}");
+            return;
+        }
+    };
+    log::info!("listening for clipboard images on tcp {bind}");
+
+    loop {
+        let (mut stream, from) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                log::debug!("clipboard image accept failed: {e}");
+                continue;
+            }
+        };
+        let tx = tx.clone();
+        spawn_local(async move {
+            let mut len = [0u8; 4];
+            if let Err(e) = stream.read_exact(&mut len).await {
+                log::debug!("clipboard image from {from} aborted before header: {e}");
+                return;
+            }
+            let len = u32::from_be_bytes(len) as usize;
+            if len == 0 || len > MAX_CLIPBOARD_IMAGE {
+                log::warn!("rejecting {len}-byte clipboard image from {from}");
+                return;
+            }
+            let mut png = vec![0u8; len];
+            if let Err(e) = stream.read_exact(&mut png).await {
+                log::warn!("clipboard image from {from} truncated: {e}");
+                return;
+            }
+            log::info!("received {len}-byte clipboard image from {from}");
+            if tx.send(IncomingImage { from, png }).is_err() {
+                log::debug!("clipboard image channel closed; dropping image from {from}");
+            }
+        });
+    }
+}
+
+/// Hand one PNG image to `addr`, which listens on the same port number
+/// as its DTLS listener.
+async fn send_clipboard_image(addr: SocketAddr, png: &[u8]) -> io::Result<()> {
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+    log::info!("sending {} byte clipboard image to {addr}", png.len());
+    stream.write_all(&(png.len() as u32).to_be_bytes()).await?;
+    stream.write_all(png).await?;
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
+/// `tokio::select!` arm helper for the clipboard image channel. Pends
+/// forever once the channel is closed so the `select!` doesn't
+/// busy-spin during shutdown.
+async fn recv_clipboard_image(rx: &mut Receiver<IncomingImage>) -> IncomingImage {
+    match rx.recv().await {
+        Some(image) => image,
+        None => std::future::pending().await,
+    }
 }
 
 pub struct Service {
@@ -130,6 +225,13 @@ pub struct Service {
     /// loop and fans the resulting events out to peers whose
     /// `clipboard_send` is true.
     clipboard_monitor: Option<ClipboardMonitor>,
+    /// Sink for images that arrive from a peer. A dedicated handle
+    /// keeps the image path out of the input-emulation request queue.
+    clipboard_sink: Option<ClipboardEmulation>,
+    /// Images received on the side TCP channel, folded into the main
+    /// loop so the clipboard write and the poll-loop bookkeeping stay
+    /// on one task.
+    clipboard_image_rx: Receiver<IncomingImage>,
     /// Recent forwards keyed on `(originator_fingerprint, hash)`.
     /// Used to break N-peer rebroadcast cycles: when this device
     /// receives a forwarded clipboard frame and would re-fan to
@@ -292,6 +394,18 @@ impl Service {
                     None
                 }
             };
+        // Image sync is best-effort for the same reason as the monitor:
+        // a session without clipboard access still gets mouse/keyboard
+        // sharing.
+        let clipboard_sink = match ClipboardEmulation::new() {
+            Ok(sink) => Some(sink),
+            Err(e) => {
+                log::warn!("clipboard image sink unavailable: {e}; images won't be received");
+                None
+            }
+        };
+        let (clipboard_image_tx, clipboard_image_rx) = channel();
+        spawn_local(clipboard_image_listener(port, clipboard_image_tx));
         let service = Self {
             config,
             capture,
@@ -319,6 +433,8 @@ impl Service {
             clipboard_monitor,
             recent_forwarded: HashMap::new(),
             clipboard_suppression,
+            clipboard_sink,
+            clipboard_image_rx,
             fastest_streak: HashMap::new(),
         };
         Ok(service)
@@ -365,6 +481,9 @@ impl Service {
                 _ = discovery_refresh_tick.tick() => self.on_discovery_refresh().await,
                 event = recv_clipboard(&mut self.clipboard_monitor) => {
                     self.handle_local_clipboard_event(event).await;
+                }
+                image = recv_clipboard_image(&mut self.clipboard_image_rx) => {
+                    self.handle_incoming_image(image).await;
                 }
                 result = shutdown_signal() => break result?,
             }
@@ -889,11 +1008,17 @@ impl Service {
         let Some(event) = event else {
             return;
         };
-        let input_capture::CaptureEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(
-            content,
-        ))) = event
-        else {
-            return;
+        let content = match event {
+            // Images skip the DTLS channel entirely and ride the side
+            // TCP channel instead (`broadcast_clipboard_image`).
+            input_capture::CaptureEvent::ClipboardImage(png) => {
+                self.broadcast_clipboard_image(png);
+                return;
+            }
+            input_capture::CaptureEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(
+                content,
+            ))) => content,
+            _ => return,
         };
         let targets = self.client_manager.clipboard_send_targets();
         if targets.is_empty() {
@@ -924,6 +1049,92 @@ impl Service {
         }
     }
 
+    /// Fan a locally copied image out to every peer whose
+    /// `clipboard_send` is on. Each send runs as its own task: a slow or
+    /// unreachable peer must not stall the main loop, and unlike the
+    /// in-band text path there is no retry — a dropped image is not
+    /// worth a second full transfer.
+    fn broadcast_clipboard_image(&self, png: Vec<u8>) {
+        let targets = self.client_manager.clipboard_send_targets();
+        if targets.is_empty() {
+            log::trace!(
+                "clipboard image captured ({} bytes) but no peer has clipboard_send=true; skipping",
+                png.len()
+            );
+            return;
+        }
+        if png.len() > MAX_CLIPBOARD_IMAGE {
+            log::warn!(
+                "dropping {} byte clipboard image: over the {} byte cap",
+                png.len(),
+                MAX_CLIPBOARD_IMAGE
+            );
+            return;
+        }
+        let png = Arc::new(png);
+        for handle in targets {
+            let Some(addr) = self.client_manager.active_addr(handle) else {
+                log::debug!("no active address for clipboard image target {handle}");
+                continue;
+            };
+            if addr.is_ipv6() {
+                log::debug!("skipping clipboard image to {addr}: side channel is IPv4 only");
+                continue;
+            }
+            let png = png.clone();
+            spawn_local(async move {
+                if let Err(e) = send_clipboard_image(addr, &png).await {
+                    log::warn!("clipboard image to {addr} failed: {e}");
+                }
+            });
+        }
+    }
+
+    /// A peer pushed an image over the side channel. Apply it locally
+    /// and record its key so the poll loop doesn't echo it back.
+    async fn handle_incoming_image(&mut self, image: IncomingImage) {
+        let IncomingImage { from, png } = image;
+        if !self.is_known_peer_ip(from.ip()) {
+            log::warn!("dropping clipboard image from unknown peer {from}");
+            return;
+        }
+        let Some(sink) = self.clipboard_sink.as_ref() else {
+            log::warn!("dropping clipboard image from {from}: no clipboard access");
+            return;
+        };
+        match sink.set_image_png(png).await {
+            Ok(key) => {
+                if let Some(monitor) = self.clipboard_monitor.as_ref() {
+                    monitor.update_last_key(key);
+                }
+                log::info!("applied clipboard image from {from}");
+            }
+            Err(e) => log::warn!("failed to apply clipboard image from {from}: {e}"),
+        }
+    }
+
+    /// Loose allowlist for the side channel. That channel is a plain TCP
+    /// connection with no DTLS handshake behind it, so the only thing to
+    /// go on is the source address: accept it when it belongs to a peer
+    /// we have a client entry for, or to a peer with a live inbound
+    /// session.
+    ///
+    /// `shortcut:` the per-peer `clipboard_receive` toggle is not
+    /// consulted here — authorization on this channel is address-based
+    /// only, which is fine for a trusted LAN but would need the DTLS
+    /// session identity before this could ship upstream.
+    fn is_known_peer_ip(&self, ip: IpAddr) -> bool {
+        if self.incoming_conns.iter().any(|addr| addr.ip() == ip) {
+            return true;
+        }
+        self.client_manager.get_client_states().iter().any(
+            |(_, _, state)| {
+                state.ips.contains(&ip)
+                    || state.active_addr.is_some_and(|addr| addr.ip() == ip)
+            },
+        )
+    }
+
     /// Forwarded clipboard frame just landed via the listen side
     /// (the local clipboard has already been updated by
     /// `emulation::ListenTask`). Refresh the
@@ -938,7 +1149,7 @@ impl Service {
         content: String,
     ) {
         if let Some(monitor) = self.clipboard_monitor.as_ref() {
-            monitor.update_last_content(content.clone());
+            monitor.update_last_key(clipboard_key_text(&content));
         }
         let hash = clipboard_hash(&content);
         self.prune_recent_forwarded();

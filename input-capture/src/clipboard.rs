@@ -1,5 +1,5 @@
 use arboard::Clipboard;
-use input_event::{ClipboardEvent, Event};
+use input_event::{clipboard_key_image, clipboard_key_text, ClipboardEvent, Event};
 use mousehop_ipc::AppIdent;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,11 @@ pub type SuppressionList = Arc<Mutex<HashSet<AppIdent>>>;
 pub struct ClipboardMonitor {
     event_rx: Receiver<CaptureEvent>,
     _event_tx: Sender<CaptureEvent>,
-    last_content: Arc<Mutex<Option<String>>>,
+    /// Dedup key of the last clipboard state we emitted or applied.
+    /// Keys are built by `input_event::clipboard_key_*` so the
+    /// receiving peer derives the same key from the bytes it decoded,
+    /// which is what stops a synced copy from bouncing back.
+    last_key: Arc<Mutex<Option<Vec<u8>>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
 }
@@ -38,18 +42,18 @@ impl ClipboardMonitor {
 
     /// Construct a monitor that consults `suppression` on every
     /// detected clipboard change and skips both the emit AND the
-    /// `last_content` update when [`frontmost_app::frontmost_app()`]
+    /// `last_key` update when [`frontmost_app::frontmost_app()`]
     /// reports an app whose [`AppIdent`] is in the list. Skipping
-    /// the `last_content` update is intentional: it keeps the
+    /// the `last_key` update is intentional: it keeps the
     /// monitor "blind" to the suppressed content so a later non-
     /// suppressed copy of the same string still emits normally.
     pub fn with_suppression(suppression: SuppressionList) -> Result<Self, CaptureError> {
         let (event_tx, event_rx) = mpsc::channel(16);
-        let last_content: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
-        let last_content_clone = last_content.clone();
+        let last_key_clone = last_key.clone();
         let last_change_clone = last_change.clone();
         let enabled_clone = enabled.clone();
         let event_tx_clone = event_tx.clone();
@@ -95,7 +99,7 @@ impl ClipboardMonitor {
                 }
 
                 // Read clipboard in blocking task
-                let last_content_clone2 = last_content_clone.clone();
+                let last_key_clone2 = last_key_clone.clone();
                 let last_change_clone2 = last_change_clone.clone();
                 let event_tx_clone2 = event_tx_clone.clone();
                 let suppression_clone2 = suppression_clone.clone();
@@ -110,21 +114,55 @@ impl ClipboardMonitor {
                         }
                     };
 
-                    // Get current clipboard text
-                    let current_text = match clipboard.get_text() {
+                    // Read the clipboard as text, falling back to an
+                    // image. `Polled` keeps the payload in the form
+                    // the later emit needs (raw RGBA is not re-encoded
+                    // until we know we're emitting).
+                    enum Polled {
+                        Text(String),
+                        Image {
+                            width: u32,
+                            height: u32,
+                            rgba: Vec<u8>,
+                        },
+                    }
+                    let polled = match clipboard.get_text() {
                         Ok(text) => {
                             log::trace!("Clipboard text read: {} bytes", text.len());
-                            text
+                            Polled::Text(text)
                         }
-                        Err(e) => {
-                            // Clipboard might be empty or contain non-text data
-                            log::trace!("Failed to get clipboard text: {e}");
-                            return;
-                        }
+                        Err(e) => match clipboard.get_image() {
+                            Ok(image) => {
+                                let (width, height) = (image.width as u32, image.height as u32);
+                                log::trace!(
+                                    "Clipboard image read: {width}x{height}, {} bytes",
+                                    image.bytes.len()
+                                );
+                                Polled::Image {
+                                    width,
+                                    height,
+                                    rgba: image.bytes.into_owned(),
+                                }
+                            }
+                            Err(_) => {
+                                // Clipboard is empty or holds something
+                                // we don't sync (files, rich text).
+                                log::trace!("Failed to get clipboard text or image: {e}");
+                                return;
+                            }
+                        },
+                    };
+                    let current_key = match &polled {
+                        Polled::Text(text) => clipboard_key_text(text),
+                        Polled::Image {
+                            width,
+                            height,
+                            rgba,
+                        } => clipboard_key_image(*width, *height, rgba),
                     };
 
                     // Check if content changed
-                    let mut last_content = last_content_clone2.lock().unwrap();
+                    let mut last_key = last_key_clone2.lock().unwrap();
                     let mut last_change = last_change_clone2.lock().unwrap();
 
                     let last_change_elapsed = last_change.map(|t| t.elapsed());
@@ -135,8 +173,8 @@ impl ClipboardMonitor {
                     // Pre-compute the inputs here so the classifier
                     // stays a pure function.
                     let needs_decision = PollDecision::content_might_emit(
-                        &current_text,
-                        last_content.as_deref(),
+                        &current_key,
+                        last_key.as_deref(),
                         last_change_elapsed,
                     );
                     let (concealed, suppressed) = if needs_decision {
@@ -151,17 +189,17 @@ impl ClipboardMonitor {
                         (false, None)
                     };
                     let decision = PollDecision::classify(
-                        &current_text,
-                        last_content.as_deref(),
+                        &current_key,
+                        last_key.as_deref(),
                         last_change_elapsed,
                         concealed,
                         suppressed.is_some(),
                     );
-                    // Always advance `last_content` after a state-
+                    // Always advance `last_key` after a state-
                     // changing decision (Suppressed or Emit),
                     // regardless of which suppression branch
                     // fired. The earlier "blind to suppressed
-                    // value" approach left `last_content` at the
+                    // value" approach left `last_key` at the
                     // previous emitted value, which made every
                     // subsequent 500ms poll see the SAME
                     // suppressed content as "changed" and re-run
@@ -173,7 +211,7 @@ impl ClipboardMonitor {
                     // contract — see the unit tests at the
                     // bottom of this file.
                     if decision.advances_state() {
-                        *last_content = Some(current_text.clone());
+                        *last_key = Some(current_key);
                         *last_change = Some(Instant::now());
                     }
                     match decision {
@@ -193,10 +231,29 @@ impl ClipboardMonitor {
                             }
                         }
                         PollDecision::Emit => {
-                            log::info!("Clipboard changed, length: {} bytes", current_text.len());
-                            let event = CaptureEvent::Input(Event::Clipboard(
-                                ClipboardEvent::Text(current_text),
-                            ));
+                            let event = match polled {
+                                Polled::Text(text) => {
+                                    log::info!("Clipboard text changed, {} bytes", text.len());
+                                    CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text(text)))
+                                }
+                                Polled::Image {
+                                    width,
+                                    height,
+                                    rgba,
+                                } => match encode_png(width, height, &rgba) {
+                                    Ok(png) => {
+                                        log::info!(
+                                            "Clipboard image changed, {width}x{height}, {} bytes",
+                                            png.len()
+                                        );
+                                        CaptureEvent::ClipboardImage(png)
+                                    }
+                                    Err(e) => {
+                                        log::warn!("failed to encode clipboard image: {e}");
+                                        return;
+                                    }
+                                },
+                            };
                             let _ = event_tx_clone2.blocking_send(event);
                         }
                     }
@@ -208,7 +265,7 @@ impl ClipboardMonitor {
         Ok(Self {
             event_rx,
             _event_tx: event_tx,
-            last_content,
+            last_key,
             last_change,
             enabled,
         })
@@ -233,14 +290,31 @@ impl ClipboardMonitor {
         log::info!("Clipboard monitoring disabled");
     }
 
-    /// Update the last known clipboard content (called when we set the clipboard)
-    /// This prevents detecting our own clipboard changes as external changes
-    pub fn update_last_content(&self, content: String) {
-        let mut last_content = self.last_content.lock().unwrap();
+    /// Record a clipboard state we just applied ourselves (called by
+    /// the peer-facing side after it sets the clipboard). Prevents the
+    /// next poll from treating our own write as a fresh local copy.
+    /// `key` must come from `input_event::clipboard_key_*`.
+    pub fn update_last_key(&self, key: Vec<u8>) {
+        let mut last_key = self.last_key.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
-        *last_content = Some(content);
+        *last_key = Some(key);
         *last_change = Some(Instant::now());
     }
+}
+
+/// PNG-encode raw RGBA pixels. The clipboard image channel only ever
+/// carries PNG.
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or("pixel buffer does not match dimensions")?;
+    let mut png = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(png)
 }
 
 /// macOS password managers stamp `org.nspasteboard.ConcealedType`
@@ -309,7 +383,7 @@ fn pasteboard_change_count_advanced() -> bool {
 
     // Initial sentinel `i64::MIN` ensures the first call always
     // returns `true` so we read once at startup to seed the
-    // diff-against-`last_content` machinery downstream.
+    // diff-against-`last_key` machinery downstream.
     static LAST: AtomicI64 = AtomicI64::new(i64::MIN);
 
     let pb = NSPasteboard::generalPasteboard();
@@ -319,7 +393,7 @@ fn pasteboard_change_count_advanced() -> bool {
 }
 
 /// Outcome of a single clipboard-poll cycle. Pulled into a pure
-/// function so the focus-race invariant — "advance `last_content`
+/// function so the focus-race invariant — "advance `last_key`
 /// on every state-changing decision, even when we suppress" — is
 /// pinned by unit tests rather than implicit in the closure
 /// body.
@@ -348,11 +422,11 @@ impl PollDecision {
     /// `is_suppressed()` calls when the content hasn't changed
     /// or the debounce window blocks emission anyway.
     fn content_might_emit(
-        current_text: &str,
-        last_content: Option<&str>,
+        current_key: &[u8],
+        last_key: Option<&[u8]>,
         last_change_elapsed: Option<Duration>,
     ) -> bool {
-        if last_content == Some(current_text) {
+        if last_key == Some(current_key) {
             return false;
         }
         last_change_elapsed.is_none_or(|d| d > Duration::from_millis(200))
@@ -362,13 +436,13 @@ impl PollDecision {
     /// I/O, no global state — so the focus-race invariant is
     /// expressible as a series of `assert_eq!` calls.
     fn classify(
-        current_text: &str,
-        last_content: Option<&str>,
+        current_key: &[u8],
+        last_key: Option<&[u8]>,
         last_change_elapsed: Option<Duration>,
         concealed: bool,
         suppressed_match: bool,
     ) -> Self {
-        if last_content == Some(current_text) {
+        if last_key == Some(current_key) {
             return Self::Unchanged;
         }
         let debounce_passed = last_change_elapsed.is_none_or(|d| d > Duration::from_millis(200));
@@ -382,7 +456,7 @@ impl PollDecision {
         }
     }
 
-    /// True when this decision must advance `last_content` /
+    /// True when this decision must advance `last_key` /
     /// `last_change` in the caller. Both `Suppressed` and `Emit`
     /// are state-changing — the focus-race fix lives here.
     fn advances_state(self) -> bool {
@@ -395,10 +469,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_unchanged_when_text_matches_last_content() {
+    fn classify_unchanged_when_text_matches_last_key() {
         let d = PollDecision::classify(
-            "secret",
-            Some("secret"),
+            b"secret",
+            Some(&b"secret"[..]),
             Some(Duration::from_secs(60)),
             false,
             false,
@@ -413,8 +487,8 @@ mod tests {
         // hold off so a peer's set_clipboard echo doesn't bounce
         // back as a fresh local emit.
         let d = PollDecision::classify(
-            "new",
-            Some("old"),
+            b"new",
+            Some(&b"old"[..]),
             Some(Duration::from_millis(100)),
             false,
             false,
@@ -426,8 +500,8 @@ mod tests {
     #[test]
     fn classify_emit_when_changed_unsuppressed() {
         let d = PollDecision::classify(
-            "new",
-            Some("old"),
+            b"new",
+            Some(&b"old"[..]),
             Some(Duration::from_secs(1)),
             false,
             false,
@@ -441,15 +515,15 @@ mod tests {
         // No prior advance: the first poll always falls through
         // to Emit (assuming nothing's suppressed) so the very
         // first clipboard read after startup is broadcast.
-        let d = PollDecision::classify("first", None, None, false, false);
+        let d = PollDecision::classify(b"first", None, None, false, false);
         assert_eq!(d, PollDecision::Emit);
     }
 
     #[test]
     fn classify_suppressed_when_concealed() {
         let d = PollDecision::classify(
-            "password",
-            Some("plain"),
+            b"password",
+            Some(&b"plain"[..]),
             Some(Duration::from_secs(1)),
             true,
             false,
@@ -460,8 +534,8 @@ mod tests {
     #[test]
     fn classify_suppressed_when_app_list_matches() {
         let d = PollDecision::classify(
-            "password",
-            Some("plain"),
+            b"password",
+            Some(&b"plain"[..]),
             Some(Duration::from_secs(1)),
             false,
             true,
@@ -470,21 +544,21 @@ mod tests {
     }
 
     /// The focus-race invariant: a Suppressed decision MUST tell
-    /// the caller to advance `last_content`. If this assert
+    /// the caller to advance `last_key`. If this assert
     /// fails, the regression we hit live (1Password password
     /// leaks on Ghostty alt-tab after copy) is back.
     #[test]
     fn suppressed_decision_advances_state() {
         let d = PollDecision::classify(
-            "password",
-            Some("plain"),
+            b"password",
+            Some(&b"plain"[..]),
             Some(Duration::from_secs(1)),
             false,
             true,
         );
         assert!(
             d.advances_state(),
-            "Suppressed must advance last_content; otherwise the \
+            "Suppressed must advance last_key; otherwise the \
              same content gets re-checked on the next poll and a \
              focus shift between polls will leak the password."
         );
@@ -497,8 +571,16 @@ mod tests {
     #[test]
     fn non_state_changing_decisions_do_not_advance() {
         for (current, last, elapsed) in [
-            ("same", Some("same"), Some(Duration::from_secs(1))),
-            ("new", Some("old"), Some(Duration::from_millis(50))),
+            (
+                &b"same"[..],
+                Some(&b"same"[..]),
+                Some(Duration::from_secs(1)),
+            ),
+            (
+                &b"new"[..],
+                Some(&b"old"[..]),
+                Some(Duration::from_millis(50)),
+            ),
         ] {
             let d = PollDecision::classify(current, last, elapsed, false, false);
             assert!(
@@ -514,20 +596,20 @@ mod tests {
         // suppression probes. Same matrix as `classify`'s "no
         // emission possible" cases.
         assert!(!PollDecision::content_might_emit(
-            "same",
-            Some("same"),
+            b"same",
+            Some(&b"same"[..]),
             None
         ));
         assert!(!PollDecision::content_might_emit(
-            "new",
-            Some("old"),
+            b"new",
+            Some(&b"old"[..]),
             Some(Duration::from_millis(50))
         ));
         assert!(PollDecision::content_might_emit(
-            "new",
-            Some("old"),
+            b"new",
+            Some(&b"old"[..]),
             Some(Duration::from_secs(1))
         ));
-        assert!(PollDecision::content_might_emit("new", None, None));
+        assert!(PollDecision::content_might_emit(b"new", None, None));
     }
 }

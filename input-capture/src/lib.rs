@@ -75,6 +75,12 @@ pub enum CaptureEvent {
     },
     /// input event coming from capture handle
     Input(Event),
+    /// Image copied to the local clipboard, PNG-encoded. Images never
+    /// travel as a [`Event`]: the input protocol carries one event per
+    /// DTLS datagram with a 4 KiB budget, which a screenshot blows
+    /// past by orders of magnitude. The daemon ships them over a side
+    /// TCP channel instead.
+    ClipboardImage(Vec<u8>),
     /// the capture wrapper detected sustained back-toward-host motion
     /// past the configured threshold (the user has pinned the cursor
     /// at the host-adjacent edge of the guest and kept pushing). The
@@ -95,6 +101,9 @@ impl Display for CaptureEvent {
                 ..
             } => write!(f, "begin capture @ ({x}, {y})"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
+            CaptureEvent::ClipboardImage(png) => {
+                write!(f, "clipboard image ({} PNG bytes)", png.len())
+            }
             CaptureEvent::AutoRelease => write!(f, "auto-release"),
             CaptureEvent::HostInputState(state) => write!(f, "host input {state:?}"),
         }
