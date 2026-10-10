@@ -77,6 +77,27 @@ pub enum ClipboardEvent {
     Text(String),
 }
 
+/// Dedup key for clipboard text, used by the capture-side poll loop to
+/// recognize a pasteboard write it caused itself.
+pub fn clipboard_key_text(text: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(text.len() + 1);
+    key.push(0);
+    key.extend_from_slice(text.as_bytes());
+    key
+}
+
+/// Dedup key for clipboard images. Both ends of a transfer build this
+/// from the decoded pixels (not from the encoded payload), so the
+/// receiver produces byte-identical keys to the sender's capture side.
+pub fn clipboard_key_image(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(rgba.len() + 9);
+    key.push(1);
+    key.extend_from_slice(&width.to_be_bytes());
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(rgba);
+    key
+}
+
 #[derive(PartialEq, Debug, Clone)]
 pub enum Event {
     /// pointer event (motion / button / axis)
